@@ -450,6 +450,97 @@ def load_model(name, device, precision):
     return model
 
 # ==========================================
+# Conditioning 同步
+# ------------------------------------------
+# 背景：H3 内核 comfy/ldm/minimax/model.py:644-655 会把 conditioning 中缓存的
+# 历史帧（上一片段尾帧 / Motion Context / 首尾帧 keyframe）填回"本次不重新生成"
+# 的帧位，要求 cond_video_rows 与 img_update 的行数严格相等：
+#
+#     all_video_rows[~img_update] = cond_video_rows   # 第 654 行
+#
+# latent 行数由分辨率决定（H3 VAE 空间压缩 16x，再按 patch 展开）：
+#     512x896  -> latent 32x56 -> 约 5505 行
+#     768x1344 -> latent 48x84 -> 约 6043 行
+#
+# 放大节点只放大了 latent，若不同步 conditioning 中记录的 latent_h/latent_w
+# 以及按旧尺寸算出的 minimax_keyframes / minimax_refs，下一段采样时就会：
+#     RuntimeError: shape mismatch: value tensor of shape [5505, 96]
+#                   cannot be broadcast to indexing result of shape [6043, 96]
+#
+# 逻辑参考 supElement/ComfyUI_Element_easy 的 MinimaxH3LatentUpscaler_Adv。
+# ==========================================
+def _process_conditioning(conditioning, latent_height, latent_width, mode):
+    """Sync conditioning metadata with the upscaled latent dimensions.
+
+    Args:
+        conditioning:   ComfyUI CONDITIONING (list of [emb, meta] pairs) or None
+        latent_height:  target latent height (NOT pixels)
+        latent_width:   target latent width  (NOT pixels)
+        mode:           "pass_through" | "NO_refs" | "refs"
+
+    Returns:
+        Updated conditioning, or the original when pass_through / None.
+    """
+    if conditioning is None or mode == "pass_through":
+        return conditioning
+
+    out = []
+    for entry in conditioning:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            out.append(entry)
+            continue
+
+        emb, meta = entry[0], entry[1]
+        new_meta = meta.copy()
+
+        # 关键：把 conditioning 记录的尺寸改写成放大后的尺寸
+        new_meta["latent_h"] = latent_height
+        new_meta["latent_w"] = latent_width
+
+        if mode == "NO_refs":
+            # 删掉按旧尺寸算出来的历史帧，让模型跳过混合逻辑（model.py:652 判空）
+            new_meta.pop("minimax_refs", None)
+            new_meta.pop("minimax_keyframes", None)
+            print(f"[MinimaxH3-3D] Conditioning synced: {latent_width}x{latent_height} "
+                  f"latent | mode=NO_refs (removed keyframes/refs)")
+
+        elif mode == "refs":
+            # 把历史帧插值到新尺寸，保留跨段连续性（可能引入轻微 ghosting）
+            def upscale_lat_dict(d):
+                if not isinstance(d, dict):
+                    return d
+                new_d = d.copy()
+                t = d.get("latent")
+                if isinstance(t, torch.Tensor):
+                    if len(t.shape) == 4:      # 图片参考 (B, C, H, W)
+                        new_d["latent"] = F.interpolate(
+                            t, size=(latent_height, latent_width),
+                            mode='bicubic', align_corners=False)
+                    elif len(t.shape) == 5:    # 视频参考 (B, C, T, H, W)
+                        b, c, tf, h, w = t.shape
+                        t_flat = t.permute(0, 2, 1, 3, 4).contiguous().view(-1, c, h, w)
+                        ups = F.interpolate(
+                            t_flat, size=(latent_height, latent_width),
+                            mode='bicubic', align_corners=False)
+                        nh, nw = ups.shape[-2], ups.shape[-1]
+                        new_d["latent"] = ups.view(b, tf, c, nh, nw).permute(0, 2, 1, 3, 4)
+                new_d["latent_h"] = latent_height
+                new_d["latent_w"] = latent_width
+                return new_d
+
+            for key in ["minimax_refs", "minimax_keyframes"]:
+                val = meta.get(key)
+                if val is not None and isinstance(val, list):
+                    new_meta[key] = [upscale_lat_dict(item) for item in val]
+
+            print(f"[MinimaxH3-3D] Conditioning synced: {latent_width}x{latent_height} "
+                  f"latent | mode=refs (upscaled keyframes/refs)")
+
+        out.append([emb, new_meta])
+
+    return out
+
+# ==========================================
 # ComfyUI node (new API)
 # ==========================================
 class UpscaleMode(str, Enum):
@@ -508,16 +599,27 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                 # ---- 硬件 / 精度选项组 ----
                 io.Combo.Input("device", options=["cuda", "rocm", "cpu"], default="cuda"),
                 io.Combo.Input("precision", options=["fp32", "fp16", "bf16"], default="fp16"),
+
+                # ---- Conditioning 同步（多片段衔接修复）----
+                io.AnyType.Input("conditioning", optional=True,
+                                 tooltip="Optional CONDITIONING to sync with the upscaled latent. "
+                                         "Fixes 'shape mismatch' when chaining H3 clips with Motion Context or keyframes."),
+                io.Combo.Input("conditioning_mode", options=["pass_through", "NO_refs", "refs"], default="NO_refs",
+                               tooltip="pass_through=leave conditioning untouched (original behavior) | "
+                                       "NO_refs=update latent_h/w and REMOVE keyframes/refs (fixes shape mismatch) | "
+                                       "refs=update latent_h/w and UPSCALE keyframes/refs (keeps continuity, may ghost)"),
             ],
             outputs=[
                 io.AnyType.Output("latent", tooltip="Upscaled latent."),
+                io.AnyType.Output("conditioning", tooltip="Conditioning synced to the new latent size."),
             ],
         )
 
     @classmethod
     def execute(cls, latent: dict, model_name: str, mode: UpscaleConfig,
                 align: int, enable_temporal_chunking: bool, force_unload: bool,
-                device: str, precision: str) -> io.NodeOutput:
+                device: str, precision: str,
+                conditioning=None, conditioning_mode: str = "NO_refs") -> tuple:
 
         if model_name.startswith('('):
             raise ValueError("Please place model files into the latent_upscale_models directory")
@@ -572,7 +674,9 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
             raise ValueError("This model only supports upscaling (effective scale >= 1.0).")
 
         if w_out == w_in and h_out == h_in:
-            return io.NodeOutput(latent)
+            # 尺寸未变化，仍同步 conditioning（保证下游拿到一致的元数据）
+            return (latent,
+                    _process_conditioning(conditioning, h_out, w_out, conditioning_mode))
 
         print(f"[MinimaxH3-3D] Latent {w_in}x{h_in} -> {w_out}x{h_out} | "
               f"Pixels {w_out * downsample}x{h_out * downsample} | scale={effective_scale:.3f}")
@@ -607,7 +711,9 @@ class MinimaxH3LatentUpscaler3D(io.ComfyNode):
                 torch.cuda.empty_cache()
             gc.collect()
 
-        return io.NodeOutput({"samples": out})
+        # 5. Conditioning 同步：把 conditioning 记录的尺寸/历史帧对齐到放大后的 latent
+        return ({"samples": out},
+                _process_conditioning(conditioning, h_out, w_out, conditioning_mode))
 
 # ==========================================
 # Registration
